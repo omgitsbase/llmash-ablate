@@ -15,6 +15,8 @@
 //
 // Prompt files hold one prompt per line. Progress goes to stdout as lines starting with "ablate: ", each a word
 // for the phase followed by key=value pairs.
+//
+// Maybe I'll organize in the future but it's the same exe even if I do.
 
 #include "arg.h"
 #include "chat.h"
