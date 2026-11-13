@@ -4,7 +4,13 @@
 It removes a chat model's refusals without touching its weights: it finds the direction each
 layer's residual stream uses for "refuse", searches for how much of it to take out, and writes a
 small control vector that projects it away at inference. The model file is never changed, and the
-vector works on any quantization of it.
+vector works on any quantization of it. The vector is a few hundred KB (1.2 MB on a 27B), and
+deleting it undoes the change.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/abliterate-dark.svg">
+  <img alt="Refusals out of 100 harmful prompts before and after llmash ablate, with the KL cost, across four models" src="docs/abliterate-light.svg">
+</picture>
 
 | model | refusals before | after | first-token KL | search |
 |---|--:|--:|--:|--:|
@@ -15,7 +21,16 @@ vector works on any quantization of it.
 
 Refusals are counted on 100 held-out prompts from `mlabonne/harmful_behaviors` by a model reading
 each whole answer, not by matching words. KL is how far the first answer token moves on harmless
-prompts. Times are on one RTX PRO 6000.
+prompts, and says nothing about later tokens. Times are on one RTX PRO 6000.
+
+Against [AEON Ultimate](https://huggingface.co/AEON-7/Qwen3.8-27B-AEON-ULTIMATE-UNCENSORED-BF16),
+another Qwen3.8-27B abliteration graded the same way:
+
+| build | refusals | what it changes | search |
+|---|--:|---|---|
+| Qwen3.8-27B, as released | 94/100 | nothing | none |
+| AEON Ultimate | 36/100 | the bf16 weights | 50 trials on an H200 |
+| llmash-ablate | 2/100 | a 1.2 MB sidecar | 16 passes, 70 s on one RTX PRO 6000 |
 
 ## Method
 
