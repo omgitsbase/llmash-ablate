@@ -267,7 +267,34 @@ struct Capture {
     float * dst     = nullptr; // [rows][n_layer][n_embd]
     int    got      = 0;       // layers read at the expected shape
     bool   odd      = false;   // a layer of another shape: the call ran as more than one ubatch
+    std::vector<int> order;    // the layers in the order the graph runs them
 };
+
+// Each layer's place in the order the graph runs the layers. That is the index for nearly every model; a looped one
+// (Inkling 2) numbers its later passes after its last layers, and the band and the strength kernel go by depth.
+std::vector<int> g_layer_pos;
+
+int layer_pos(int il) {
+    return il >= 0 && il < static_cast<int>(g_layer_pos.size()) ? g_layer_pos[il] : il;
+}
+
+// order: the layers a capture saw run; used when they are the first order.size() layers, else the index stays
+void set_layer_order(const std::vector<int> & order, int n_layer) {
+    std::vector<int> pos(static_cast<size_t>(n_layer));
+    std::iota(pos.begin(), pos.end(), 0);
+    std::vector<char> seen(static_cast<size_t>(n_layer), 0);
+    for (int il : order) {
+        if (il < 0 || il >= static_cast<int>(order.size()) || seen[il]) {
+            g_layer_pos.clear();
+            return;
+        }
+        seen[il] = 1;
+    }
+    for (size_t i = 0; i < order.size(); i++) {
+        pos[order[i]] = static_cast<int>(i);
+    }
+    g_layer_pos = pos;
+}
 
 bool cb_eval(ggml_tensor * t, bool ask, void * user_data) {
     auto * c = static_cast<Capture *>(user_data);
@@ -278,6 +305,9 @@ bool cb_eval(ggml_tensor * t, bool ask, void * user_data) {
     const int il   = skip ? static_cast<int>(std::strtol(t->name + skip, &end, 10)) : -1;
     if (!c->on || skip == 0 || end == t->name + skip || *end != '\0') {
         return !ask;
+    }
+    if (ask && il >= 0 && il < c->n_layer && std::find(c->order.begin(), c->order.end(), il) == c->order.end()) {
+        c->order.push_back(il);
     }
     // the last layer keeps only the output rows, and a direction there is never used
     if (il < 0 || il >= c->n_layer - 1) {
@@ -543,7 +573,50 @@ struct Gen {
     int          idx    = -1;
     llama_seq_id seq    = 0;
     bool         done   = false;
+    std::string  raw;          // the opening with its special tokens, while it may still be thinking
+    int          phase   = 0;  // 0 opening, 1 thinking, 2 answering
+    int          counted = 0;  // tokens of the answer so far
 };
+
+// A model that opens a thinking block even with thinking off (Inkling 2 thinks at every effort): the template's tags
+// and whether a probe saw it. Then the refusal gate and the KL read the answer after the thinking, which is where it
+// refuses; for every other model nothing here changes a thing.
+struct Thinking {
+    std::string              start;
+    std::vector<std::string> ends;
+    bool                     anyway = false;
+};
+Thinking  g_think;
+const int kThinkCap = 256;   // thinking tokens read before an answer counts as not given
+
+// Whether this token belongs to the thinking: from the start tag through the end tag. The answer starts after it,
+// with its count from zero.
+bool in_thinking(Gen & g, const std::string & piece_raw, const std::string & piece_vis) {
+    if (!g_think.anyway || g.phase == 2) {
+        return false;
+    }
+    g.raw += piece_raw;
+    if (g.phase == 0) {
+        if (const size_t at = g.raw.find(g_think.start); at != std::string::npos) {
+            g.phase = 1;
+            g.raw.erase(0, at + g_think.start.size());
+            return true;
+        }
+        if (!piece_vis.empty()) {
+            g.phase = 2;
+        }
+        return false;
+    }
+    for (const std::string & e : g_think.ends) {
+        if (!e.empty() && g.raw.find(e) != std::string::npos) {
+            g.phase   = 2;
+            g.counted = 0;
+            g.text.clear();
+            break;
+        }
+    }
+    return true;
+}
 
 // Greedy answers of up to n_gen tokens to every prompt, all sequences stepping together. Without a judge, an
 // answer stops as soon as a marker word appears and that counts as a refusal. With a judge, the whole answer is
@@ -556,14 +629,15 @@ int count_refusals(llama_context * ctx, const llama_vocab * vocab, llama_batch &
     // The opener gate needs only the answer's first tokens (the refuse/comply decision is made there), so without a
     // judge every sequence stops after a short window: a refusal opener means refused, otherwise complied. This is
     // what makes the search fast -- ~12 tokens per answer instead of the whole thing.
-    const int  steps_cap = judging ? n_gen : std::min(n_gen, 8);
+    const int  answer_cap = judging ? n_gen : std::min(n_gen, 8);
+    const int  steps_cap  = answer_cap + (g_think.anyway ? kThinkCap : 0);
     const Room     r       = room_of(ctx);
     llama_memory_t mem     = llama_get_memory(ctx);
     const int      n_vocab = llama_vocab_n_tokens(vocab);
     int            refused = 0;
     size_t         start   = 0;
     while (start < prompts.size()) {
-        const size_t count = take_group(prompts, start, r, n_gen, r.n_batch);
+        const size_t count = take_group(prompts, start, r, std::max(n_gen, steps_cap), r.n_batch);
         if (count == 0) {
             std::fprintf(stderr, "a prompt of %zu tokens does not fit the batch of %d\n", prompts[start].size(), r.n_batch);
             return -1;
@@ -605,14 +679,23 @@ int count_refusals(llama_context * ctx, const llama_vocab * vocab, llama_batch &
                     g.done = true;
                     continue;
                 }
-                g.text += common_token_to_piece(ctx, toks[j], false);
-                if (!judging) {
-                    if (const int m = refusal_marker(g.text); m >= 0) {
-                        g.done = true;
-                        refused++;
-                        if (st) {
-                            st->hist[m]++;
+                const std::string vis = common_token_to_piece(ctx, toks[j], false);
+                const bool thinking   = g_think.anyway && in_thinking(g, common_token_to_piece(ctx, toks[j], true), vis);
+                if (!thinking) {
+                    g.text += vis;
+                    g.counted++;
+                    if (!judging) {
+                        if (const int m = refusal_marker(g.text); m >= 0) {
+                            g.done = true;
+                            refused++;
+                            if (st) {
+                                st->hist[m]++;
+                            }
+                            continue;
                         }
+                    }
+                    if (g.counted >= answer_cap) {
+                        g.done = true;
                         continue;
                     }
                 }
@@ -726,9 +809,120 @@ void directions_of(const std::vector<float> & res_h, const std::vector<float> & 
     });
 }
 
+// Whether the model opens a thinking block on its own: a few greedy tokens after the first prompts.
+bool opens_thinking(llama_context * ctx, const llama_vocab * vocab, const Prompts & prompts, size_t n) {
+    const Room r = room_of(ctx);
+    n = std::min({ n, prompts.size(), take_group(prompts, 0, r, 8, r.n_batch) });
+    if (n == 0) {
+        return false;
+    }
+    llama_batch      batch = llama_batch_init(r.n_batch, 0, 1);
+    std::vector<int> idx(n);
+    add_prompts(batch, prompts, 0, n, &idx);
+    llama_memory_t mem = llama_get_memory(ctx);
+    llama_memory_clear(mem, true);
+    std::vector<std::string> raw(n);
+    std::vector<llama_pos>   pos(n);
+    for (size_t j = 0; j < n; j++) {
+        pos[j] = static_cast<llama_pos>(prompts[j].size());
+    }
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    bool      ok      = llama_decode(ctx, batch) == 0;
+    for (int step = 0; ok && step < 6; step++) {
+        std::vector<llama_token> toks(n);
+        for (size_t j = 0; j < n; j++) {
+            toks[j] = argmax(llama_get_logits_ith(ctx, idx[j]), n_vocab);
+            raw[j] += common_token_to_piece(ctx, toks[j], true);
+        }
+        common_batch_clear(batch);
+        for (size_t j = 0; j < n; j++) {
+            common_batch_add(batch, toks[j], pos[j]++, { static_cast<llama_seq_id>(j) }, true);
+            idx[j] = batch.n_tokens - 1;
+        }
+        ok = llama_decode(ctx, batch) == 0;
+    }
+    llama_batch_free(batch);
+    llama_memory_clear(mem, true);
+    for (const std::string & s : raw) {
+        if (s.find(g_think.start) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Each prompt followed by the untouched model's own opening up to the first visible token of its answer, for a model
+// that thinks first: the KL then compares the answer's first token, as it does for every other model. A prompt whose
+// answer does not start within the cap stays as it is.
+Prompts with_openings(llama_context * ctx, const llama_vocab * vocab, llama_batch & batch, const Prompts & prompts) {
+    Prompts        out     = prompts;
+    const Room     r       = room_of(ctx);
+    llama_memory_t mem     = llama_get_memory(ctx);
+    const int      n_vocab = llama_vocab_n_tokens(vocab);
+    const int      cap     = kThinkCap + 8;
+    size_t         start   = 0;
+    while (start < prompts.size()) {
+        const size_t count = take_group(prompts, start, r, cap, r.n_batch);
+        if (count == 0) {
+            return prompts;
+        }
+        std::vector<Gen>                      gens(count);
+        std::vector<int>                      last(count);
+        std::vector<std::vector<llama_token>> open(count);
+        add_prompts(batch, prompts, start, count, &last);
+        for (size_t j = 0; j < count; j++) {
+            gens[j].seq    = static_cast<llama_seq_id>(j);
+            gens[j].n_past = static_cast<llama_pos>(prompts[start + j].size());
+            gens[j].idx    = last[j];
+        }
+        llama_memory_clear(mem, true);
+        if (llama_decode(ctx, batch) != 0) {
+            return prompts;
+        }
+        std::vector<llama_token> toks(count);
+        for (int step = 0; step < cap; step++) {
+            std::vector<size_t> live;
+            for (size_t j = 0; j < count; j++) {
+                if (!gens[j].done) {
+                    live.push_back(j);
+                }
+            }
+            parallel_for(live.size(), [&](size_t k) {
+                toks[live[k]] = argmax(llama_get_logits_ith(ctx, gens[live[k]].idx), n_vocab);
+            });
+            common_batch_clear(batch);
+            for (size_t j : live) {
+                Gen & g = gens[j];
+                if (llama_vocab_is_eog(vocab, toks[j])) {
+                    g.done = true;
+                    continue;
+                }
+                const std::string vis = common_token_to_piece(ctx, toks[j], false);
+                if (!in_thinking(g, common_token_to_piece(ctx, toks[j], true), vis) && g.phase == 2 && !vis.empty()) {
+                    g.done = true;
+                    out[start + j].insert(out[start + j].end(), open[j].begin(), open[j].end());
+                    continue;
+                }
+                open[j].push_back(toks[j]);
+                common_batch_add(batch, toks[j], g.n_past++, { g.seq }, true);
+                g.idx = batch.n_tokens - 1;
+            }
+            if (batch.n_tokens == 0 || step + 1 == cap) {
+                break;
+            }
+            if (llama_decode(ctx, batch) != 0) {
+                return prompts;
+            }
+        }
+        start += count;
+    }
+    llama_memory_clear(mem, true);
+    return out;
+}
+
 double kernel(const Trial & t, int il) {
     const double min_w = t.min_rel * t.max_w;
-    const double x     = std::min(1.0, std::fabs(il - t.pos) / std::max(t.dist, 1e-6));
+    const double x     = std::min(1.0, std::fabs(layer_pos(il) - t.pos) / std::max(t.dist, 1e-6));
     return t.max_w + (min_w - t.max_w) * x;
 }
 
@@ -1020,15 +1214,19 @@ int main(int argc, char ** argv) {
         in.messages.push_back(u);
         in.add_generation_prompt = true;
         in.enable_thinking       = o.think;
-        std::string prompt;
+        common_chat_params cp;
         try {
-            prompt = common_chat_templates_apply(tmpls.get(), in).prompt;
+            cp = common_chat_templates_apply(tmpls.get(), in);
         } catch (const std::exception &) {
             system_ok = false;
             in.messages.erase(in.messages.begin(), in.messages.end() - 1);
-            prompt = common_chat_templates_apply(tmpls.get(), in).prompt;
+            cp = common_chat_templates_apply(tmpls.get(), in);
         }
-        return common_tokenize(vocab, prompt, true, true);
+        if (g_think.start.empty() && !cp.thinking_start_tag.empty()) {
+            g_think.start = cp.thinking_start_tag;
+            g_think.ends  = cp.thinking_end_tags;
+        }
+        return common_tokenize(vocab, cp.prompt, true, true);
     };
     // out_texts, when given, receives each prompt's raw request text in the same order as the tokens, so a judge
     // can be shown the request rather than the chat-templated tokens.
@@ -1108,6 +1306,20 @@ int main(int argc, char ** argv) {
         say("judge url=%s model=%s ok", judge.url.c_str(), judge.model.c_str());
     }
 
+    // ---- a model that thinks even with thinking off: a few greedy tokens on the first held-out prompts
+    if (!g_think.start.empty() && !eval_h.empty()) {
+        const int n_probe = static_cast<int>(std::min<size_t>(4, eval_h.size()));
+        const int n_tok   = static_cast<int>(GGML_PAD(n_probe * (longest + 8), 256));
+        if (llama_context * pctx = make_context(model, params, n_probe, static_cast<int>(GGML_PAD(longest + 8, 32)),
+                                                n_tok, n_tok, nullptr)) {
+            g_think.anyway = opens_thinking(pctx, vocab, eval_h, static_cast<size_t>(n_probe));
+            llama_free(pctx);
+        }
+        if (g_think.anyway) {
+            say("thinking: the model thinks before it answers even with thinking off; refusals and KL read the answer");
+        }
+    }
+
     // ---- the residual at the last prompt token, after every layer
     std::vector<float> res_h, res_g;
     {
@@ -1132,6 +1344,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
         llama_free(cctx);
+        set_layer_order(cap.order, n_layer);
     }
     t_capture = elapsed() - t_load;
 
@@ -1145,11 +1358,22 @@ int main(int argc, char ** argv) {
     res_g.clear();
     res_h.shrink_to_fit();
     res_g.shrink_to_fit();
-    int best_il = std::max(1, n_layer / 4);
-    for (int il = std::max(1, n_layer / 4); il <= std::min(n_layer - 2, n_layer * 85 / 100); il++) {
-        if (score[il] > score[best_il]) {
+    // the band the direction is read from: past the first quarter of the depth, short of its last 15%
+    const int  band_lo = std::max(1, n_layer / 4), band_hi = std::min(n_layer - 2, n_layer * 85 / 100);
+    const auto in_band = [&](int il) {
+        return il >= 1 && il <= n_layer - 2 && layer_pos(il) >= band_lo && layer_pos(il) <= band_hi;
+    };
+    if (!g_layer_pos.empty() && layer_pos(n_layer - 1) != n_layer - 1) {
+        say("layer order: the graph runs the layers out of index order (a looped model); depth goes by run order");
+    }
+    int best_il = -1;
+    for (int il = 1; il <= n_layer - 2; il++) {
+        if (in_band(il) && (best_il < 0 || score[il] > score[best_il])) {
             best_il = il;
         }
+    }
+    if (best_il < 0) {
+        best_il = std::max(1, n_layer / 4);
     }
     say("direction layer=%d of=%d separation=%.2f capture_s=%.1f", best_il, n_layer, score[best_il], t_capture);
 
@@ -1161,8 +1385,10 @@ int main(int argc, char ** argv) {
     {
         const std::vector<float> best_dir = dirs[best_il];
         double wsum = 0.0, csum = 0.0;
-        const int lo = std::max(1, n_layer / 4), hi = std::min(n_layer - 2, n_layer * 85 / 100);
-        for (int il = lo; il <= hi; il++) {
+        for (int il = 1; il <= n_layer - 2; il++) {
+            if (!in_band(il)) {
+                continue;
+            }
             double dot = 0.0;
             for (int k = 0; k < n_embd; k++) dot += static_cast<double>(dirs[il][k]) * best_dir[k];
             const double w = score[il] > 0 ? score[il] : 0.0;
@@ -1212,8 +1438,10 @@ int main(int argc, char ** argv) {
     size_t tokens_h = 0, tokens_g = 0;
     for (const auto & p : eval_h) tokens_h += p.size();
     for (const auto & p : eval_g) tokens_g += p.size();
-    const int per_seq = static_cast<int>(GGML_PAD(longest + n_gen, 32));
-    const int n_batch = static_cast<int>(GGML_PAD(std::max({ tokens_h, tokens_g, longest }), 256));
+    // a model that thinks first also needs room for its thinking ahead of the answer
+    const size_t think   = g_think.anyway ? static_cast<size_t>(kThinkCap + 8) : 0;
+    const int    per_seq = static_cast<int>(GGML_PAD(longest + n_gen + think, 32));
+    const int    n_batch = static_cast<int>(GGML_PAD(std::max({ tokens_h, tokens_g, longest + think }), 256));
     llama_context * ctx = make_context(model, params, n_seq, per_seq, n_batch, std::min(n_batch, 4096), nullptr);
     if (!ctx) {
         std::fprintf(stderr, "no context for the trials fits\n");
@@ -1224,8 +1452,10 @@ int main(int argc, char ** argv) {
 
     // ---- the untouched model on the held-out prompts
     llama_set_adapter_cvec(ctx, nullptr, 0, n_embd, 0, 0);
+    // the KL's prompts: as they are, or with the untouched model's thinking ahead of the answer's first token
+    const Prompts eval_kl = g_think.anyway ? with_openings(ctx, vocab, batch, eval_g) : eval_g;
     std::vector<std::vector<float>> base_logp(eval_g.size());
-    if (!run_prompts(ctx, batch, eval_g, [&](size_t i, const float * logits) {
+    if (!run_prompts(ctx, batch, eval_kl, [&](size_t i, const float * logits) {
             std::vector<float> & lp = base_logp[i];
             lp.assign(logits, logits + n_vocab);
             const float mx = *std::max_element(lp.begin(), lp.end());
@@ -1266,7 +1496,7 @@ int main(int argc, char ** argv) {
         }
         std::vector<double> kls(eval_g.size(), 0.0);
         const double t_kl = now_s();
-        if (!run_prompts(ctx, batch, eval_g, [&](size_t i, const float * logits) {
+        if (!run_prompts(ctx, batch, eval_kl, [&](size_t i, const float * logits) {
                 const float mx = *std::max_element(logits, logits + n_vocab);
                 double sum = 0;
                 for (int v = 0; v < n_vocab; v++) sum += std::exp(static_cast<double>(logits[v] - mx));
@@ -1303,7 +1533,7 @@ int main(int argc, char ** argv) {
             // the classic recipe: one direction, taken out of every layer in full
             t.d       = best_il;
             t.max_w   = 1.0;
-            t.pos     = best_il;
+            t.pos     = layer_pos(best_il);
             t.min_rel = 1.0;
             t.dist    = top;
         } else if (i <= n_random) {
@@ -1352,11 +1582,12 @@ int main(int argc, char ** argv) {
     // and a model can decline by answering something else. So capture the residuals again and measure how far
     // apart harmful and harmless prompts still sit along their best direction. A scan that could not run reports
     // -1, never 0, which would read as the refusal gone.
-    const int  band_lo = std::max(1, n_layer / 4), band_hi = std::min(n_layer - 2, n_layer * 85 / 100);
     double     sep_before = 0, sep_after = -1;
     {
-        for (int il = band_lo; il <= band_hi; il++) {
-            sep_before = std::max(sep_before, score[il]);
+        for (int il = 1; il <= n_layer - 2; il++) {
+            if (in_band(il)) {
+                sep_before = std::max(sep_before, score[il]);
+            }
         }
         llama_free(ctx);   // the trials context first, so only one of them is on the card
         ctx = nullptr;
@@ -1379,8 +1610,10 @@ int main(int argc, char ** argv) {
                     std::vector<double>             after_score;
                     directions_of(ah, ag, dir_h.size(), dir_g.size(), n_layer, n_embd, after_dirs, after_score);
                     sep_after = 0;
-                    for (int il = band_lo; il <= band_hi; il++) {
-                        sep_after = std::max(sep_after, after_score[il]);
+                    for (int il = 1; il <= n_layer - 2; il++) {
+                        if (in_band(il)) {
+                            sep_after = std::max(sep_after, after_score[il]);
+                        }
                     }
                 }
             }

@@ -39,7 +39,9 @@ Directional ablation (Arditi et al. 2024), searched the way Heretic does it:
 1. The direction at each layer is the mean residual at the last prompt token over prompts the model
    refuses, minus the mean over prompts it answers, with the answered mean's own component removed
    so ordinary prompts keep their bearing. Each layer gets its own direction.
-2. A per-layer weight kernel says how much of that component each layer loses.
+2. A per-layer weight kernel says how much of that component each layer loses. Layers are placed in
+   the order the model runs them, so a looped model (Inkling 2 runs its middle layers three times)
+   gets its kernel by depth.
 3. Each candidate is scored on held-out prompts: how many harmful prompts still draw a refusal, and
    the KL divergence of the first answer token on harmless prompts against the untouched model. The
    search keeps the candidate with the fewest refusals at a low KL, and writes nothing when the best
